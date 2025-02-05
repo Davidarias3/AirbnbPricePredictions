@@ -1,0 +1,312 @@
+
+
+
+##Load Packages
+```{r setup}
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(rpart.plot)
+library(xgboost)
+library(vip)
+source("https://tiny.utk.edu/plot_centroids_table.R")
+
+```
+#read in data
+```{r}
+austin_listings <- read.csv("austin_listings.csv")
+head(austin_listings)
+
+listings_data_dictionary <- read.csv("listings_data_dictionary.csv")
+head(listings_data_dictionary)
+
+holdout_x <- read.csv("holdout_x.csv")
+head(holdout_x)
+```
+
+#Null out columns
+```{r}
+
+austin_listings$id <- NULL
+austin_listings$listing_url <- NULL
+austin_listings$picture_url <- NULL
+austin_listings$host_id <- NULL
+austin_listings$host_url <- NULL
+austin_listings$description <- NULL
+austin_listings$name <- NULL
+austin_listings$host_name <- NULL
+austin_listings$host_response_rate <- NULL
+austin_listings$host_since <- NULL
+austin_listings$host_is_superhost <- NULL
+austin_listings$host_acceptance_rate <- NULL
+austin_listings$host_total_listings_count <- NULL
+```
+
+
+
+#hierarchical clustering analysis
+```{r}
+austin_listings_clustering <- austin_listings
+austin_listings_clustering$room_type <- NULL
+austin_listings_clustering$host_response_time <- NULL
+
+#recipe for clustering 
+log_cols <- c("accommodates","bathrooms","minimum_nights", "number_of_reviews", "bedrooms", "beds")
+
+
+austin_clustering_recipe <- recipe(austin_listings_clustering) |>
+  step_impute_mean(all_numeric()) %>% 
+  step_log(all_of(log_cols), offset = .001, base = 10) %>% 
+  step_center(all_numeric()) |>
+  step_scale(all_numeric())
+
+
+austin_clustering_recipe |>
+  prep()
+
+austin_clustering_scaled <- austin_clustering_recipe |>
+  prep() |>
+  bake(austin_listings_clustering)
+
+sapply(austin_clustering_scaled, function(x) sum(is.na(x)))
+
+```
+
+```{r}
+#proof of scaling 
+
+sapply(austin_clustering_scaled, mean)
+sapply(austin_clustering_scaled, sd)
+```
+
+#Provide a plot of the dendrogram.
+
+```{r}
+dist_mat <- dist(austin_clustering_scaled)
+clst <- hclust(dist_mat, method = "ward.D2")
+plot(clst)
+```
+
+```{r}
+# Creating a copy of our data so we can create
+# a column that holds the cluster label
+# (i.e. a column of what cluster each row belongs to)
+labeled_austin_scaled <- austin_clustering_scaled
+```
+
+##CUTTREE
+```{r}
+labeled_austin_scaled <- labeled_austin_scaled |>
+  mutate(k3 = cutree(clst, k = 3))
+
+table(labeled_austin_scaled$k3)
+```
+
+```{r}
+labeled_austin_scaled$k4 <- cutree(clst, k = 4)
+labeled_austin_scaled$k5 <- cutree(clst, k = 5)
+labeled_austin_scaled$k6 <- cutree(clst, k = 6)
+
+
+labeled_austin_scaled <- labeled_austin_scaled |>
+  mutate(k4 = cutree(clst, k = 4)) |>
+  mutate(k5 = cutree(clst, k = 5)) %>% 
+  mutate(k6 = cutree(clst, k = 6))
+
+
+table(labeled_austin_scaled$k4)
+table(labeled_austin_scaled$k5)
+table(labeled_austin_scaled$k6)
+
+```
+
+#hierarchical clustering results
+
+## K5 is best, easy to interpret, each cluster has good insight on cluster-defining atributes
+```{r}
+plot_mean_by_label_table(
+  labeled_austin_scaled,
+  label_column = "k3",
+  summary_func = mean,
+  drop_cols = c("k4", "k5",  "k6")
+)
+
+plot_mean_by_label_table(
+  labeled_austin_scaled,
+  label_column = "k4",
+  summary_func= mean,
+  drop_cols = c("k3", "k5",  "k6")
+)
+
+plot_mean_by_label_table(
+  labeled_austin_scaled,
+  label_column = "k5",
+  summary_func= mean,
+  drop_cols = c("k3", "k4", "k6")
+)
+
+plot_mean_by_label_table(
+  labeled_austin_scaled,
+  label_column = "k6",
+  summary_func = mean,
+  drop_cols = c("k3", "k4", "k5")
+)
+```
+
+
+##TEST/TRAIN SPLITS
+```{r}
+set.seed(42)
+splits <- initial_split(austin_listings, prop = 0.8)
+
+austin_listings_train <- training(splits)
+austin_listings_test <- testing(splits)
+```
+
+#plot matrix
+```{r}
+austin_listings_train |>
+  select(where(is.numeric)) |>
+  pivot_longer(everything(), names_to = "feature") |>
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~feature, scales = "free")
+
+
+
+
+```
+
+## DECISION TREE RECIPE
+
+```{r}
+log_cols <- c("accommodates","bathrooms", "bedrooms" , "beds", "minimum_nights", "number_of_reviews", "zip_code")
+
+
+
+austin_listings_recipe <- recipe(price ~., austin_listings_train) %>% 
+  step_impute_median(all_numeric_predictors()) %>% 
+  step_log(all_of(log_cols), offset = 1.001, base = 10) %>% 
+  step_dummy(all_nominal_predictors()) |>
+  step_corr(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) %>% 
+  step_nzv(all_numeric_predictors())
+  
+ 
+
+austin_listings_recipe |>
+  prep()
+
+cleaned_austin_listings <- austin_listings_recipe |>
+  prep() |>
+  bake(austin_listings)
+
+cleaned_austin_listings
+
+```
+
+### Boosted trees
+
+```{r}
+# What steps to clean and what model to use
+austin_listings_recipe <- recipe(price ~., austin_listings_train) %>% 
+  step_impute_median(all_numeric_predictors()) %>% 
+  step_log(all_of(log_cols), offset = 1.001, base = 10) %>% 
+  step_dummy(all_nominal_predictors()) |>
+  step_corr(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) %>% 
+  step_nzv(all_numeric_predictors())
+
+austin_listings_boost <- boost_tree(
+  mode = "regression",
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  sample_size = tune()
+)
+
+austin_listings_wf_boost_cv <- workflow() |> 
+  add_recipe(austin_listings_recipe) |> 
+  add_model(austin_listings_boost)
+
+# Set up the cross-validation to find the best value of mtry
+austin_listings_boost_grid <- grid_regular(
+  mtry(range = c(1, 4)),
+  trees(),
+  min_n(), 
+  tree_depth(),
+  learn_rate(),
+  sample_prop(),
+  levels = 2
+)
+
+folds <- vfold_cv(austin_listings_train, v = 5)
+
+# Perform cross-validation
+austin_listings_boost_cv_results <- tune_grid(
+  austin_listings_wf_boost_cv,
+  resamples = folds,
+  grid = austin_listings_boost_grid,
+  control = control_grid(verbose = TRUE)
+)
+
+# Find value of mtry that performed the best and tell the workflow to use it
+(best_params <- select_best(austin_listings_boost_cv_results))
+austin_listings_wf_boost <- finalize_workflow(austin_listings_wf_boost_cv, best_params)
+
+# Fit workflow using that good value
+austin_listings_wf_boost_fit <- austin_listings_wf_boost |> 
+  fit(austin_listings_train)
+```
+
+#Assess performance on train/test
+
+```{r}
+#train
+austin_listings_wf_boost_fit |> 
+  predict(austin_listings_train) |> 
+  bind_cols(austin_listings_train) |> 
+  metrics(truth = price, estimate = .pred)
+
+#test
+austin_listings_wf_boost_fit |> 
+  predict(austin_listings_test) |> 
+  bind_cols(austin_listings_test) |> 
+  metrics(truth = price, estimate = .pred)
+```
+
+
+#Fit the model and plot
+
+```{r}
+austin_listings_wf_boost_fit |> 
+  predict(austin_listings_test) |> 
+  bind_cols(austin_listings_test) |> 
+  arrange(desc(.pred))
+```
+
+#Most important variables to the tree's predictions
+
+```{r}
+vip(austin_listings_wf_boost_fit, num_features = 14)
+
+
+
+
+```
+
+#kaggle csv
+```{r}
+holdout_x <- read.csv("holdout_x.csv")
+
+submit_me_to_kaggleBT2 <- austin_listings_wf_boost_fit %>% 
+  predict(holdout_x) %>% 
+  bind_cols(holdout_x) %>% 
+  dplyr::select(id, price = .pred)
+
+write.csv(submit_me_to_kaggleBT2, "tree_predsBT2.csv", row.names = FALSE)
+
+
+```
